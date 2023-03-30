@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -52,6 +54,11 @@ type contentRange struct {
 type generationCondition struct {
 	ifGenerationMatch    *int64
 	ifGenerationNotMatch *int64
+}
+
+type xmlMultipart struct {
+	obj   Object
+	parts [][]byte // TODO store to disk instead?
 }
 
 func (c generationCondition) ConditionsMet(activeGeneration int64) bool {
@@ -177,6 +184,164 @@ func (s *Server) insertFormObject(r *http.Request) xmlResponse {
 		return xmlResponse{status: successActionStatus, data: xmlBody}
 	}
 	return xmlResponse{status: successActionStatus}
+}
+
+func (s *Server) initiateMultipartUpload(r *http.Request) xmlResponse {
+	bucketName := unescapeMuxVars(mux.Vars(r))["bucketName"]
+	key := unescapeMuxVars(mux.Vars(r))["objectName"]
+	id, err := generateUploadID()
+	if err != nil {
+		return xmlResponse{
+			status:       http.StatusInternalServerError,
+			errorMessage: err.Error(),
+		}
+	}
+
+	obj := Object{
+		ObjectAttrs: ObjectAttrs{
+			BucketName: bucketName,
+			Name:       key,
+		},
+	}
+
+	if contentType := r.Header.Get(contentTypeHeader); contentType != "" {
+		obj.ContentType, _, _ = mime.ParseMediaType(contentType)
+	}
+
+	s.uploads.Store(id, xmlMultipart{
+		obj:   obj,
+		parts: make([][]byte, 1000, 1000), // TODO describe
+	})
+
+	body := InitiateMultipartUploadResult{
+		UploadId: id,
+		Bucket:   obj.BucketName,
+		Key:      obj.Name,
+	}
+
+	raw, err := xml.Marshal(body)
+	if err != nil {
+		return xmlResponse{
+			status:       http.StatusInternalServerError,
+			errorMessage: err.Error()}
+	}
+
+	return xmlResponse{
+		status: http.StatusCreated,
+		data:   []byte(xml.Header + string(raw)),
+	}
+}
+
+func (s *Server) uploadMultipart(r *http.Request) xmlResponse {
+	defer r.Body.Close()
+	uploadId := r.URL.Query().Get("uploadId")
+	partNumberParam := r.URL.Query().Get("partNumber")
+	if uploadId == "" && partNumberParam == "" {
+		// Simple upload
+		return xmlResponse{status: http.StatusBadRequest} // TODO implement
+	}
+	partNumber, err := strconv.Atoi(partNumberParam)
+	if err != nil {
+		return xmlResponse{status: http.StatusBadRequest}
+	}
+	rawObj, ok := s.uploads.Load(uploadId)
+	if !ok {
+		return xmlResponse{status: http.StatusNotFound}
+	}
+
+	part := rawObj.(xmlMultipart)
+	content, err := io.ReadAll(r.Body)
+	if err != nil {
+		return xmlResponse{errorMessage: err.Error()}
+	}
+
+	crc32c := checksum.EncodedCrc32cChecksum(content)
+	md5Hash := checksum.EncodedMd5Hash(content)
+	etag := fmt.Sprintf("%q", md5Hash)
+
+	part.parts[partNumber-1] = content // TODO store etag instead of recalculating it later?
+	s.uploads.Store(uploadId, part)
+
+	headers := http.Header{}
+	headers.Set("ETag", etag)
+	headers.Add("x-goog-hash", fmt.Sprintf("crc32c=%s", crc32c))
+	headers.Add("x-goog-hash", fmt.Sprintf("md5=%s", md5Hash))
+
+	return xmlResponse{
+		header: headers,
+	}
+}
+
+func (s *Server) completeMultipartUpload(r *http.Request) xmlResponse {
+	var body CompleteMultipartUploadRequest
+	err := xml.NewDecoder(r.Body).Decode(&body)
+	if err != nil {
+		return xmlResponse{
+			status:       http.StatusBadRequest,
+			errorMessage: err.Error(),
+		}
+	}
+
+	uploadId := r.URL.Query().Get("uploadId")
+
+	bucketName := unescapeMuxVars(mux.Vars(r))["bucketName"]
+	key := unescapeMuxVars(mux.Vars(r))["objectName"]
+
+	rawObj, ok := s.uploads.Load(uploadId)
+	if !ok {
+		return xmlResponse{status: http.StatusNotFound}
+	}
+	parts := rawObj.(xmlMultipart)
+	obj := parts.obj
+
+	if parts.parts[len(body.Part)] != nil {
+		return xmlResponse{status: http.StatusBadRequest} // TODO describe
+	}
+
+	// sort parts
+	sort.Slice(body.Part[:], func(i, j int) bool {
+		return body.Part[i].PartNumber < body.Part[j].PartNumber
+	})
+
+	for i, p := range body.Part {
+		if i+1 != p.PartNumber {
+			return xmlResponse{status: http.StatusBadRequest} // Missing part number
+		}
+		part := parts.parts[p.PartNumber-1]
+		md5Hash := checksum.EncodedMd5Hash(part)
+		etag := fmt.Sprintf("%q", md5Hash)
+		if !p.ETag.Equals(etag) {
+			return xmlResponse{status: http.StatusBadRequest} // TODO set correct error status
+		}
+		obj.Content = append(obj.Content, part...)
+	}
+
+	obj.Crc32c = checksum.EncodedCrc32cChecksum(obj.Content)
+	obj.Md5Hash = checksum.EncodedMd5Hash(obj.Content)
+	obj.Etag = fmt.Sprintf("%q", obj.Md5Hash)
+
+	s.uploads.Delete(uploadId)
+	_, err = s.createObject(obj.StreamingObject(), backend.NoConditions{})
+	if err != nil {
+		return xmlResponse{status: http.StatusInternalServerError}
+	}
+	resp := CompleteMultipartUploadResult{
+		Bucket:   obj.BucketName,
+		Key:      obj.Name,
+		Location: fmt.Sprintf("%s://%s/%s/%s", s.scheme(), s.publicHost, bucketName, key),
+		ETag:     ETag{Value: obj.Etag},
+	}
+	raw, err := xml.Marshal(resp)
+	if err != nil {
+		return xmlResponse{
+			status:       http.StatusBadRequest,
+			errorMessage: err.Error(),
+		}
+	}
+	return xmlResponse{
+		status: http.StatusCreated, // TODO support other statuses
+		data:   []byte(xml.Header + string(raw)),
+	}
 }
 
 func (s *Server) wrapUploadPreconditions(r *http.Request, bucketName string, objectName string) (generationCondition, error) {

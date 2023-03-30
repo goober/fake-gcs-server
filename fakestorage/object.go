@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -571,6 +572,54 @@ func (s *Server) listObjects(r *http.Request) jsonResponse {
 	return jsonResponse{data: newListObjectsResponse(objs, prefixes)}
 }
 
+func (s *Server) xmlListObjects(r *http.Request) xmlResponse {
+	bucketName := unescapeMuxVars(mux.Vars(r))["bucketName"]
+	opts := ListOptions{
+		Prefix:    r.URL.Query().Get("prefix"),
+		Delimiter: r.URL.Query().Get("delimiter"),
+		Versions:  r.URL.Query().Get("versions") == "true",
+	}
+	objs, prefixes, err := s.ListObjectsWithOptions(bucketName, opts)
+	if err != nil {
+		return xmlResponse{status: http.StatusInternalServerError} // TODO handle errors
+	}
+
+	result := ListBucketResult{
+		Name:      bucketName,
+		Delimiter: opts.Delimiter,
+		Prefix:    opts.Prefix,
+		KeyCount:  len(objs),
+	}
+
+	for _, prefix := range prefixes {
+		result.CommonPrefixes = append(result.CommonPrefixes, Prefix{Value: prefix})
+	}
+
+	for _, obj := range objs {
+		result.Contents = append(result.Contents, Contents{
+			Key:          obj.Name,
+			Generation:   obj.Generation,
+			Size:         obj.Size,
+			LastModified: obj.Updated.Format(time.RFC3339),
+			ETag:         ETag{Value: obj.Etag},
+		})
+	}
+	if len(objs) > 0 {
+		result.NextMarker = objs[0].Name
+	}
+	raw, err := xml.Marshal(result)
+	if err != nil {
+		return xmlResponse{
+			status:       http.StatusInternalServerError,
+			errorMessage: err.Error()}
+	}
+
+	return xmlResponse{
+		status: http.StatusCreated, // TODO fix response code
+		data:   []byte(xml.Header + string(raw)),
+	}
+}
+
 func (s *Server) getObject(w http.ResponseWriter, r *http.Request) {
 	if alt := r.URL.Query().Get("alt"); alt == "media" || r.Method == http.MethodHead {
 		s.downloadObject(w, r)
@@ -805,6 +854,7 @@ func (s *Server) downloadObject(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, lastByte, obj.Size))
 	}
 	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("ETag", obj.Etag)
 	w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
 	w.Header().Set("X-Goog-Generation", strconv.FormatInt(obj.Generation, 10))
 	w.Header().Set("X-Goog-Hash", fmt.Sprintf("crc32c=%s,md5=%s", obj.Crc32c, obj.Md5Hash))

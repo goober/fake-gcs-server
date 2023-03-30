@@ -266,8 +266,6 @@ func (s *Server) buildMuxer() {
 	s.mux.Path("/_internal/reseed").Methods(http.MethodPut, http.MethodPost).HandlerFunc(jsonToHTTPHandler(s.reseedServer))
 	// Internal - end
 
-	bucketHost := fmt.Sprintf("{bucketName}.%s", s.publicHost)
-	s.mux.Host(bucketHost).Path("/{objectName:.+}").Methods(http.MethodGet, http.MethodHead).HandlerFunc(s.downloadObject)
 	s.mux.Path("/download/storage/v1/b/{bucketName}/o/{objectName:.+}").Methods(http.MethodGet).HandlerFunc(s.downloadObject)
 	s.mux.Path("/upload/storage/v1/b/{bucketName}/o").Methods(http.MethodPost).HandlerFunc(jsonToHTTPHandler(s.insertObject))
 	s.mux.Path("/upload/storage/v1/b/{bucketName}/o").Methods(http.MethodPut).HandlerFunc(jsonToHTTPHandler(s.uploadFileContent))
@@ -277,18 +275,64 @@ func (s *Server) buildMuxer() {
 	s.mux.MatcherFunc(s.publicHostMatcher).Path("/batch/storage/v1").Methods(http.MethodPost).HandlerFunc(s.handleBatchCall)
 	s.mux.Path("/batch/storage/v1").Methods(http.MethodPost).HandlerFunc(s.handleBatchCall)
 
-	s.mux.MatcherFunc(s.publicHostMatcher).Path("/{bucketName}/{objectName:.+}").Methods(http.MethodGet, http.MethodHead).HandlerFunc(s.downloadObject)
-	s.mux.Host("{bucketName:.+}").Path("/{objectName:.+}").Methods(http.MethodGet, http.MethodHead).HandlerFunc(s.downloadObject)
+	// XML API
+	xmlApiRouters := []*mux.Router{
+		s.mux.Host(fmt.Sprintf("{bucketName}.%s", s.publicHost)).Subrouter(),
+		s.mux.MatcherFunc(s.publicHostMatcher).PathPrefix(`/{bucketName}`).Subrouter(),
+	}
+	for _, r := range xmlApiRouters {
+		r.Path("/").Methods(http.MethodGet).HandlerFunc(xmlToHTTPHandler(s.xmlListObjects))
+		r.Path("").Methods(http.MethodGet).HandlerFunc(xmlToHTTPHandler(s.xmlListObjects))
+		r.Path("/{objectName:.+}").Methods(http.MethodGet, http.MethodHead).HandlerFunc(s.downloadObject)
+
+		//Form Uploads
+		r.MatcherFunc(matchFormData).Methods(http.MethodPost, http.MethodPut).HandlerFunc(xmlToHTTPHandler(s.insertFormObject))
+
+		// Multipart uploads
+		r.Path("/{objectName:.+}").Methods(http.MethodPut).HandlerFunc(xmlToHTTPHandler(s.uploadMultipart))
+		// InitiateMultipartUpload
+		r.Path("/{objectName:.+}").MatcherFunc(func(r *http.Request, m *mux.RouteMatch) bool {
+			return r.URL.Query().Has("uploads")
+		}).Methods(http.MethodPost).HandlerFunc(xmlToHTTPHandler(s.initiateMultipartUpload))
+		// CompleteMultipartUpload
+		r.Path("/{objectName:.+}").MatcherFunc(func(r *http.Request, m *mux.RouteMatch) bool {
+			return r.URL.Query().Has("uploadId")
+		}).Methods(http.MethodPost).HandlerFunc(xmlToHTTPHandler(s.completeMultipartUpload))
+
+		// Signed URLs (upload and download)
+		r.Path("/{objectName:.+}").Methods(http.MethodGet, http.MethodHead).HandlerFunc(s.getObject)
+		r.Path("/{objectName:.+}").Methods(http.MethodPost, http.MethodPut).HandlerFunc(jsonToHTTPHandler(s.insertObject))
+
+	}
+	// List objects
+	//s.mux.MatcherFunc(s.publicHostMatcher).Path(`/{bucketName}/`).Methods(http.MethodGet).HandlerFunc(xmlToHTTPHandler(s.xmlListObjects))
+	//s.mux.MatcherFunc(s.publicHostMatcher).Path(`/{bucketName:[^\/]+$}`).Methods(http.MethodGet).HandlerFunc(xmlToHTTPHandler(s.xmlListObjects))
+
+	//s.mux.Host(bucketHost).Path("/{objectName:.+}").Methods(http.MethodGet, http.MethodHead).HandlerFunc(s.downloadObject)
+
+	//s.mux.MatcherFunc(s.publicHostMatcher).Path("/{bucketName}/{objectName:.+}").Methods(http.MethodGet, http.MethodHead).HandlerFunc(s.downloadObject)
+	//s.mux.Host("{bucketName:.+}").Path("/{objectName:.+}").Methods(http.MethodGet, http.MethodHead).HandlerFunc(s.downloadObject)
 
 	// Form Uploads
-	s.mux.Host(s.publicHost).Path("/{bucketName}").MatcherFunc(matchFormData).Methods(http.MethodPost, http.MethodPut).HandlerFunc(xmlToHTTPHandler(s.insertFormObject))
-	s.mux.Host(bucketHost).MatcherFunc(matchFormData).Methods(http.MethodPost, http.MethodPut).HandlerFunc(xmlToHTTPHandler(s.insertFormObject))
+	//s.mux.Host(s.publicHost).Path("/{bucketName}").MatcherFunc(matchFormData).Methods(http.MethodPost, http.MethodPut).HandlerFunc(xmlToHTTPHandler(s.insertFormObject))
+	//s.mux.Host(bucketHost).MatcherFunc(matchFormData).Methods(http.MethodPost, http.MethodPut).HandlerFunc(xmlToHTTPHandler(s.insertFormObject))
+
+	// Multipart uploads
+	//s.mux.MatcherFunc(s.publicHostMatcher).Path("/{bucketName}/{objectName:.+}").Methods(http.MethodPut).HandlerFunc(xmlToHTTPHandler(s.uploadMultipart))
+	// InitiateMultipartUpload
+	//s.mux.MatcherFunc(s.publicHostMatcher).Path("/{bucketName}/{objectName:.+}").MatcherFunc(func(r *http.Request, m *mux.RouteMatch) bool {
+	//	return r.URL.Query().Has("uploads")
+	// }).Methods(http.MethodPost).HandlerFunc(xmlToHTTPHandler(s.initiateMultipartUpload))
+	// CompleteMultipartUpload
+	//s.mux.MatcherFunc(s.publicHostMatcher).Path("/{bucketName}/{objectName:.+}").MatcherFunc(func(r *http.Request, m *mux.RouteMatch) bool {
+	//	return r.URL.Query().Has("uploadId")
+	//}).Methods(http.MethodPost).HandlerFunc(xmlToHTTPHandler(s.completeMultipartUpload))
 
 	// Signed URLs (upload and download)
-	s.mux.MatcherFunc(s.publicHostMatcher).Path("/{bucketName}/{objectName:.+}").Methods(http.MethodPost, http.MethodPut).HandlerFunc(jsonToHTTPHandler(s.insertObject))
-	s.mux.MatcherFunc(s.publicHostMatcher).Path("/{bucketName}/{objectName:.+}").Methods(http.MethodGet, http.MethodHead).HandlerFunc(s.getObject)
-	s.mux.Host(bucketHost).Path("/{objectName:.+}").Methods(http.MethodPost, http.MethodPut).HandlerFunc(jsonToHTTPHandler(s.insertObject))
-	s.mux.Host("{bucketName:.+}").Path("/{objectName:.+}").Methods(http.MethodPost, http.MethodPut).HandlerFunc(jsonToHTTPHandler(s.insertObject))
+	//s.mux.MatcherFunc(s.publicHostMatcher).Path("/{bucketName}/{objectName:.+}").Methods(http.MethodPost, http.MethodPut).HandlerFunc(jsonToHTTPHandler(s.insertObject))
+	//s.mux.MatcherFunc(s.publicHostMatcher).Path("/{bucketName}/{objectName:.+}").Methods(http.MethodGet, http.MethodHead).HandlerFunc(s.getObject)
+	//s.mux.Host(bucketHost).Path("/{objectName:.+}").Methods(http.MethodPost, http.MethodPut).HandlerFunc(jsonToHTTPHandler(s.insertObject))
+	//s.mux.Host("{bucketName:.+}").Path("/{objectName:.+}").Methods(http.MethodPost, http.MethodPut).HandlerFunc(jsonToHTTPHandler(s.insertObject))
 }
 
 func (s *Server) reseedServer(r *http.Request) jsonResponse {

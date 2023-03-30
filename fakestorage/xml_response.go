@@ -12,7 +12,7 @@ type xmlResponse struct {
 	errorMessage string
 }
 
-type xmlResponseBody struct {
+type xmlPostResponse struct {
 	XMLName xml.Name `xml:"PostResponse"`
 	Bucket  string
 	Etag    struct {
@@ -53,7 +53,7 @@ func xmlToHTTPHandler(h xmlHandler) http.HandlerFunc {
 }
 
 func createXmlResponseBody(bucketName, etag, key, location string) []byte {
-	responseBody := xmlResponseBody{
+	responseBody := xmlPostResponse{
 		Bucket: bucketName,
 		Etag: struct {
 			Value string `xml:",innerxml"`
